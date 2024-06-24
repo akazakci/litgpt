@@ -19,6 +19,88 @@ from litgpt.utils import (
     save_config
 )
 
+def copy_weights_hf_llama_3(
+    config: Config,
+    qkv_weights: Dict[int, List[Optional[NotYetLoadedTensor]]],
+    state_dict: Dict[str, torch.Tensor],
+    hf_weights: Dict[str, Union[torch.Tensor, NotYetLoadedTensor]],
+    saver: Optional[incremental_save] = None,
+    dtype: Optional[torch.dtype] = None,
+) -> None:
+    weight_map = {
+        "model.embed_tokens.weight": "transformer.wte.weight",
+        "model.layers.{}.input_layernorm.weight": "transformer.h.{l}.norm_1.weight",
+        "model.layers.{}.input_layernorm.bias": "transformer.h.{l}.norm_1.bias",
+        "model.layers.{}.self_attn.q_proj.weight": None,
+        "model.layers.{}.self_attn.k_proj.weight": None,
+        "model.layers.{}.self_attn.v_proj.weight": None,
+        "model.layers.{}.self_attn.o_proj.weight": "transformer.h.{l}.attn.proj.weight",
+        "model.layers.{}.post_attention_layernorm.weight": "transformer.h.{l}.norm_2.weight",
+        "model.layers.{}.post_attention_layernorm.bias": "transformer.h.{l}.norm_2.bias",
+        "model.norm.weight": "transformer.ln_f.weight",
+        "model.norm.bias": "transformer.ln_f.bias",
+        "lm_head.weight": "lm_head.weight",
+    }
+    
+    weight_map.update(
+        {
+            "model.layers.{}.mlp.gate_proj.weight": "transformer.h.{l}.mlp.fc_1.weight",
+            "model.layers.{}.mlp.up_proj.weight": "transformer.h.{l}.mlp.fc_2.weight",
+            "model.layers.{}.mlp.down_proj.weight": "transformer.h.{l}.mlp.proj.weight",
+        }
+    )
+
+    for name, param in hf_weights.items():
+        if "model.layers" in name:
+            from_name, l = layer_template(name, 2)
+            qkv = qkv_weights.setdefault(l, [None, None, None])
+            if "q_proj" in name:
+                qkv[0] = param
+            elif "k_proj" in name:
+                qkv[1] = param
+            elif "v_proj" in name:
+                qkv[2] = param
+            to_name = weight_map[from_name]
+            if to_name is None:
+                continue
+            to_name = to_name.format(l=l)
+        else:
+            to_name = weight_map[name]
+        param = load_param(param, name, dtype)
+        if saver is not None:
+            param = saver.store_early(param)
+        state_dict[to_name] = param
+
+    if "lm_head.weight" not in state_dict:
+        state_dict["lm_head.weight"] = state_dict["transformer.wte.weight"]
+
+    # convert separate q, k, v matrices into an interleaved qkv
+    for i, (q, k, v) in list(qkv_weights.items()):
+        if q is None or k is None or v is None:
+            # split across different .bin files
+            continue
+        q = load_param(q, f"layer {i} q", dtype)
+        k = load_param(k, f"layer {i} k", dtype)
+        v = load_param(v, f"layer {i} v", dtype)
+        q_per_kv = config.n_head // config.n_query_groups
+        qs = torch.split(q, config.head_size * q_per_kv)
+        ks = torch.split(k, config.head_size)
+        vs = torch.split(v, config.head_size)
+        cycled = [t for group in zip(qs, ks, vs) for t in group]
+        qkv = torch.cat(cycled)
+        state_dict[f"transformer.h.{i}.attn.attn.weight"] = qkv
+        del qkv_weights[i]
+
+    # Handle the new tokenizer
+    if "model.embed_tokens.weight" in hf_weights:
+        state_dict["transformer.wte.weight"] = hf_weights["model.embed_tokens.weight"]
+
+    # Copy the tokenizer file
+    tokenizer_path = checkpoint_dir / "tokenizer.json"
+    if tokenizer_path.exists():
+        print("Copying tokenizer.json")
+        import shutil
+        shutil.copy(tokenizer_path, checkpoint_dir / "lit_tokenizer.json")
 
 def copy_weights_gpt_neox(
     state_dict: Dict[str, torch.Tensor],
@@ -298,16 +380,6 @@ def convert_hf_checkpoint(
     model_name: Optional[str] = None,
     dtype: Optional[str] = None,
 ) -> None:
-    """
-    Convert a Hugging Face Transformers checkpoint into a LitGPT compatible checkpoint.
-
-    Arguments:
-        checkpoint_dir: Where to save the downloaded files.
-        model_name: The existing config name to load. This is useful to download alternative weights of existing
-            architectures.
-        dtype: The data type to convert the checkpoint files to. If not specified, the weights will remain in the
-            dtype they are downloaded in.
-    """
     checkpoint_dir = extend_checkpoint_dir(checkpoint_dir)
     pprint(locals())
 
@@ -321,6 +393,10 @@ def convert_hf_checkpoint(
 
     if "falcon" in model_name:
         copy_fn = partial(copy_weights_falcon, model_name)
+    elif model_name == "meta-llama/Meta-Llama-3-8B-Instruct":
+        # holder to reconstitute the split q, k, v
+        qkv_weights = {}
+        copy_fn = partial(copy_weights_hf_llama_3, config, qkv_weights)
     elif config.mlp_class_name in ("LLaMAMLP", "GemmaMLP", "LLaMAMoE"):
         # holder to reconstitute the split q, k, v
         qkv_weights = {}
@@ -357,8 +433,6 @@ def convert_hf_checkpoint(
         raise ValueError(f"Expected {str(checkpoint_dir)!r} to contain .bin files")
 
     with incremental_save(checkpoint_dir / "lit_model.pth") as saver:
-        # for checkpoints that split the QKV across several files, we need to keep all the bin files
-        # open, so we use `ExitStack` to close them all together at the end
         for bin_file in sorted(bin_files):
             print("Processing", bin_file)
             hf_weights = lazy_load(bin_file)
@@ -366,3 +440,11 @@ def convert_hf_checkpoint(
         gc.collect()
         print(f"Saving converted checkpoint to {checkpoint_dir}")
         saver.save(sd)
+
+    # Handle the new tokenizer for Llama-3
+    if model_name == "meta-llama/Meta-Llama-3-8B-Instruct":
+        tokenizer_path = checkpoint_dir / "tokenizer.json"
+        if tokenizer_path.exists():
+            print("Copying tokenizer.json for Llama-3")
+            import shutil
+            shutil.copy(tokenizer_path, checkpoint_dir / "lit_tokenizer.json")
